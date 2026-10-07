@@ -125,6 +125,7 @@ static void* wadaMp3Scratch() { return s_wada_mp3_scratch; }
 #include "LuaAppHost.h"       // sandboxed Lua apps (LUA_APPS.md Phase 1; self-gated on CAP_LUA_APPS)
 
 #include "AppPage.h"          // shared full-screen app-page chrome (both of the above use it)
+#include "AppDrawerBadge.h"    // in-place app-drawer badge updates (#612)
 #include "ReaderContent.h"    // host-tested HTML text extraction + local/network link resolution
 #include "ChannelSenderSplit.h"  // host-tested "SenderName: body" split for channel/room posts
 #include "PasteHexKey.h"        // host-tested key extraction for pasted key fields (#526)
@@ -7294,7 +7295,7 @@ static lv_obj_t* s_sysinfo_rest_lbl = nullptr;   // System-info popup slow tier 
 static lv_obj_t* s_sleep_diag_lbl  = nullptr;   // Idle-sleep instrumentation label (Lock settings, line 1)
 static lv_obj_t* s_sleep_diag_lbl2 = nullptr;   // Idle-sleep instrumentation label (Lock settings, line 2)
 #endif
-static bool      s_update_available = false;
+bool s_update_available = false;
 // Beta test reports. The state lives up here beside the version-check flags
 // because the same tick reads both; the builders and the worker are further down
 // with the rest of the HTTP code.
@@ -31052,10 +31053,17 @@ static void statusBarUnreadCb(lv_event_t* e) {
 // A toggle-in alternative to the command-centre home. The full implementation
 // lives below openControlCenter (it links to the tool openers defined there);
 // the home's Apps button and the back-key handler reach it through these.
-static lv_obj_t* s_appdrawer_root = nullptr;
+lv_obj_t* s_appdrawer_root = nullptr;
 // Badge counts baked into the drawer grid when it was last built, so the
 // refresh tick can tell whether they still match reality (see #393).
-static uint32_t  s_appdrawer_badge_sig = 0;
+uint32_t s_appdrawer_badge_sig = 0;
+int uiUnreadTotal()            { return g_lv.task ? g_lv.task->getUnreadTotal()        : 0; }
+int uiUnreadMentions()         { return g_lv.task ? g_lv.task->getUnreadMentionCount() : 0; }
+lv_obj_t** appDrawerRootPtr()  { return &s_appdrawer_root; }
+uint32_t* appDrawerBadgeSigPtr() { return &s_appdrawer_badge_sig; }
+bool*     appDrawerUpdateAvailPtr() { return &s_update_available; }
+const lv_font_t* appDrawerFont12() { return &g_font_12; }
+uint32_t appDrawerBadgeColor() { return s_theme_high_contrast ? COLOR_STATUS_DANGER : 0xE0533D; }
 
 // Is anything drawn in front of the app drawer? Tools and Lua apps are children
 // of the same layer and open over it without closing it, so "the drawer exists"
@@ -53048,6 +53056,7 @@ static void closeAppDrawer() {
   s_nav_drawer_corner = nullptr;
   s_nav_drawer_gear = nullptr;
 #endif
+  appDrawerBadgeClear();
   popupClose(&s_appdrawer_root);   // del_async + wait_release: the drawer grid scrolls, so guard the throw UAF
 }
 
@@ -53060,6 +53069,7 @@ static void closeAppDrawerSync() {
   s_nav_drawer_corner = nullptr;
   s_nav_drawer_gear = nullptr;
 #endif
+  appDrawerBadgeClear();
   if (s_appdrawer_root) { popupClose(&s_appdrawer_root); }
 }
 
@@ -53575,12 +53585,22 @@ static void addAppTile(lv_obj_t* parent, int x, int y, int w, int h,
   lv_obj_set_height(lb, lv_font_get_line_height(lv_obj_get_style_text_font(lb, LV_PART_MAIN)));
   lv_obj_align(lb, LV_ALIGN_TOP_MID, 0, 4 + chip + 4);
 
+  lv_obj_t* bdg = nullptr;
   if (badge != 0) {
-    lv_obj_t* bdg = makeCountPill(t, badge);
-    lv_obj_align(bdg, LV_ALIGN_TOP_MID, chip / 2, 0);   // over the square's top-right corner
+    bdg = makeCountPill(t, badge);
+    lv_obj_align(bdg, LV_ALIGN_TOP_MID, chip / 2, 0);
+  } else {
+    // Always create a (hidden) pill so the refresh tick can update it in place (#612).
+    bdg = makeCountPill(t, badge);
+    lv_obj_add_flag(bdg, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(bdg, LV_ALIGN_TOP_MID, chip / 2, 0);
+  }
+  // Store the pill's label for in-place badge updates.
+  if (bdg) {
+    lv_obj_t* lbl = lv_obj_get_child(bdg, 0);
+    if (lbl) appDrawerBadgeSetLabel(act, lbl);
   }
 
-  // Live: a small amber dot inside the square's top-right corner, breathing.
   if (appTileLive(act)) {
     lv_obj_t* dot = lv_obj_create(chip_o);
     lv_obj_remove_style_all(dot);
@@ -55170,29 +55190,20 @@ static void statusBarPackRight() {
 }
 
 static void updateGlobalStatusBar() {
-  // The drawer's badges are a snapshot taken when the grid was built, so a
-  // message arriving while it is open -- including while the screen was locked
-  // over it -- left the count stale until you navigated away and back (#393).
-  // Rebuild on an actual change of the counts, not every tick, using the same
-  // close/open idiom the tile-changing settings already use.
-  if (s_appdrawer_root && g_lv.task) {
+  // Refresh badges in place instead of rebuilding the grid (#612, #393).
+  // Only when the drawer is frontmost — tools/Lua apps open over it (#415).
+  if (s_appdrawer_root && g_lv.task && !appDrawerCovered()) {
     const uint32_t sig = ((uint32_t)(g_lv.task->getUnreadTotal() & 0x7FFF) << 16)
                        | (uint32_t)(g_lv.task->getUnreadMentionCount() & 0xFFFF)
                        | (s_update_available ? 0x80000000u : 0u);
-    if ((sig != s_appdrawer_badge_sig || appTilesLiveMask() != s_appdrawer_live) && !appDrawerCovered()) {
-      // Only when nothing is in front of it. Lua apps and the other tools open
-      // OVER the drawer without closing it, deliberately (see appTileCb), and
-      // openAppDrawer() ends with lv_obj_move_foreground() -- so rebuilding
-      // while one was up threw the drawer on top of the running app (#415).
-      // Leaving the signature stale is what makes this self-healing: the check
-      // runs again every tick, so the badge is right by the time the drawer is
-      // back in front, without having to hook every tool's close path.
+    if (sig != s_appdrawer_badge_sig) appDrawerRefreshBadges();
+    if (appTilesLiveMask() != s_appdrawer_live) {
+      // Live-dot state changed — rebuild is the simplest correct path here,
+      // and live state changes are rare (VNC/Remote/USB connect/disconnect).
       const lv_coord_t sx = lv_obj_get_scroll_x(s_appdrawer_root);
       const lv_coord_t sy = lv_obj_get_scroll_y(s_appdrawer_root);
       closeAppDrawer();
       openAppDrawer();
-      // Rebuilding resets the scroll, so a message arriving while you were
-      // reading the second row used to jump you back to the first.
       if (s_appdrawer_root && (sx || sy)) lv_obj_scroll_to(s_appdrawer_root, sx, sy, LV_ANIM_OFF);
     }
   }
