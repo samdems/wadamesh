@@ -2,6 +2,7 @@
 // App-drawer badge in-place updates — see AppDrawerBadge.h.
 #include <lvgl.h>
 #include <cstdio>
+#include <cstring>
 
 extern int   uiUnreadTotal();
 extern int   uiUnreadMentions();
@@ -50,7 +51,7 @@ void appDrawerRefreshBadges() {
     else if (entries[i].count > 0) snprintf(bn, sizeof bn, "%d", entries[i].count);
     else bn[0] = '\0';
 
-    lv_label_set_text(lbl, bn);
+    if (strcmp(lv_label_get_text(lbl), bn) != 0) lv_label_set_text(lbl, bn);
     if (entries[i].count == 0) lv_obj_add_flag(bdg, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_clear_flag(bdg, LV_OBJ_FLAG_HIDDEN);
   }
